@@ -579,17 +579,39 @@ pub(crate) fn adopt_and_update(
 /// filesystems like composefs that are mounted on `/`.
 ///
 /// Returns `Ok(None)` when no block-backed filesystem is found (e.g. virtiofs
-/// in bcvk ephemeral, NFS root, ISO boot), so callers can skip gracefully.
+/// in bcvk ephemeral, NFS root), so callers can skip gracefully.
 pub(crate) fn list_dev_current_root() -> Result<Option<Device>> {
+    Ok(first_block_device(&["/boot", "/sysroot"]))
+}
+
+/// Return the block device backing the first of `paths` that has one.
+fn first_block_device(paths: &[&str]) -> Option<Device> {
     let auth = cap_std::ambient_authority();
-    for path in ["/boot", "/sysroot"] {
-        if let Ok(dir) = Dir::open_ambient_dir(path, auth) {
-            if let Ok(dev) = bootc_internal_blockdev::list_dev_by_dir(&dir) {
-                return Ok(Some(dev));
-            }
-        }
-    }
-    Ok(None)
+    paths.iter().find_map(|path| {
+        let dir = Dir::open_ambient_dir(path, auth).ok()?;
+        bootc_internal_blockdev::list_dev_by_dir(&dir).ok()
+    })
+}
+
+/// Filesystem types used for the immutable root of live media (e.g. the
+/// Fedora CoreOS live ISO or PXE image, where `/sysroot` is a loop device over
+/// an erofs or squashfs image). The `ExecCondition=` in
+/// `bootloader-update.service` does the same check on the `/sysroot` mount;
+/// keep its erofs and squashfs cases in sync. It omits iso9660 because a live
+/// ISO's `/sysroot` is never the ISO9660 medium itself (Fedora CoreOS mounts
+/// that at `/run/media/iso`); it's listed here only defensively, since this
+/// check also looks at `/boot`.
+const LIVE_MEDIA_FSTYPES: &[&str] = &["iso9660", "erofs", "squashfs"];
+
+/// If `device` holds a live media filesystem, return its type.
+///
+/// Such a device is block-backed, but there's no persistent bootloader
+/// installation on it to update.
+fn live_media_fstype(device: &Device) -> Option<&str> {
+    device
+        .fstype
+        .as_deref()
+        .filter(|fstype| LIVE_MEDIA_FSTYPES.contains(fstype))
 }
 
 /// daemon implementation of component validate
@@ -777,8 +799,9 @@ impl RootContext {
 
 /// Initialize parent devices to prepare the update.
 ///
-/// Returns `Ok(None)` when no block-backed boot filesystem is found,
-/// so the caller can skip the update gracefully.
+/// Returns `Ok(None)` when there is no on-disk bootloader to update (no
+/// block-backed boot filesystem, or a live media root), so the caller can
+/// skip the update gracefully.
 fn prep_before_update() -> Result<Option<RootContext>> {
     let path = "/";
     let sysroot = Dir::open_ambient_dir(path, ambient_authority()).context("Opening root dir")?;
@@ -788,6 +811,12 @@ fn prep_before_update() -> Result<Option<RootContext>> {
         );
         return Ok(None);
     };
+    if let Some(fstype) = live_media_fstype(&device) {
+        println!(
+            "Detected live media filesystem ({fstype}); bootloader update is not applicable, skipping."
+        );
+        return Ok(None);
+    }
     Ok(Some(RootContext::new(sysroot, path, device)))
 }
 
@@ -1023,6 +1052,38 @@ fn strip_grub_config_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_first_block_device_none() {
+        // Neither of these is backed by a block device, just like the
+        // virtiofs root of a bcvk ephemeral VM.
+        assert!(first_block_device(&["/proc", "/nonexistent-bootupd-test"]).is_none());
+        assert!(first_block_device(&[]).is_none());
+    }
+
+    #[test]
+    fn test_live_media_fstype() -> Result<()> {
+        let cases = [
+            (Some("erofs"), true),
+            (Some("squashfs"), true),
+            (Some("iso9660"), true),
+            (Some("xfs"), false),
+            (Some("ext4"), false),
+            (Some("vfat"), false),
+            // e.g. a whole disk, or no blkid data from lsblk
+            (None, false),
+        ];
+        for (fstype, is_live) in cases {
+            let device: Device = serde_json::from_value(serde_json::json!({
+                "name": "loop0",
+                "size": 0,
+                "fstype": fstype,
+            }))?;
+            let expected = if is_live { fstype } else { None };
+            assert_eq!(live_media_fstype(&device), expected, "fstype {fstype:?}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_failpoint_update() {
